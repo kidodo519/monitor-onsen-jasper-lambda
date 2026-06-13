@@ -1,0 +1,69 @@
+﻿defaults:
+  timezone: "Asia/Tokyo"
+  slack:
+    webhook_url: "https://hooks.slack.com/services/xxxx"
+  s3:
+    bucket: "onsen-jasper-importer-prod-archive"
+    prefix_template: "{hotel_key}/pms-reservations/"
+    require_min_files: 1
+  db:
+    dsn_template: "postgresql://bi_readonly:xxxx@incrazetech-app-db-prod.app-prod.incrazetech.dev:5432/reservation_db_{hotel_key}"
+  checks:
+    import_tables:
+      enabled: true
+      date_column: "import_date"
+      facility_column:
+        - "facility_id"
+        - "facility_code"
+      facility_operator: "="
+      facility_value_template: "{facility_id}"
+    s3_uploads:
+      enabled: false
+      require_min_files: 1
+    repeat_track_tags_stall:
+      enabled: true
+      table: "repeat_track_tags"
+      created_at_column: "created_at"
+      max_stall_days: 3
+      facility_column: "facility_code"
+
+properties:
+  - name: "三晃商事"
+    enabled: true
+    hotel_key: "sankoh"
+    facilities:
+      - code: "1"
+        name: "夢乃井"
+      - code: "2"
+        name: "夕やけこやけ"
+      - code: "3"
+        name: "祥吉"
+      - code: "4"
+        name: "加里屋旅館Q"
+    db:
+      schema: "public"
+    checks:
+      import_tables:
+        enabled: true
+        date_column: "import_date"
+        tables:
+          - "pms_reservations_legacy"
+          - "pms_reservations_onhand_legacy"
+          - "pms_rooms_legacy"
+          - "pms_rooms_onhand_legacy"
+          - "pms_sales_legacy"
+          # - name: "enquetes"
+          #   facility_filter: false
+          - name: "yoyakuban_customer"
+            facility_filter: false
+          - "yoyakuban_reservations"
+          - "yoyakuban_reservations_onhand"
+      s3_uploads:
+        enabled: true
+        require_min_files: 1
+      repeat_track_tags_stall:
+        enabled: true
+        table: "repeat_track_tags"
+        created_at_column: "created_at"
+        max_stall_days: 3
+
