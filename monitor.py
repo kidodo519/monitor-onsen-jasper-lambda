@@ -725,34 +725,34 @@ def probe_db(dsn: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def main():
-    print("START")
-    parser = argparse.ArgumentParser(description="宿ごとのデータ監視")
-    parser.add_argument("-c", "--config", default="config.yaml")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--log-file", default="")
-    parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--probe-all", action="store_true")
-    args = parser.parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    if args.log_file:
-        fh = logging.FileHandler(args.log_file, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logging.getLogger().addHandler(fh)
+def load_config(config_path: str) -> dict:
     try:
-        try:
-            with open(args.config, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-        except UnicodeDecodeError:
-            with open(args.config, "r", encoding="cp932") as f:
-                cfg = yaml.safe_load(f)
-            logging.warning("config.yaml を cp932 で読み込みました。可能なら UTF-8 で保存してください。")
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            return yaml.safe_load(f) or {}
+    except UnicodeDecodeError:
+        with open(config_path, "r", encoding="cp932") as f:
+            cfg = yaml.safe_load(f) or {}
+        logging.warning("config.yaml を cp932 で読み込みました。可能なら UTF-8 で保存してください。")
+        return cfg
+
+
+def run_monitor(
+    config_path: str = "config.yaml",
+    dry_run: bool = False,
+    self_test: bool = False,
+    probe_all: bool = False,
+    raise_on_monitor_error: bool = False,
+) -> dict:
+    print("START")
+    try:
+        cfg = load_config(config_path)
     except Exception as e:
         print(f"CONFIG_LOAD_ERROR: {e}")
         print("RESULT: ERROR")
-        return 1
+        if raise_on_monitor_error:
+            raise
+        return {"result": "ERROR", "exit_code": 1, "error": f"CONFIG_LOAD_ERROR: {e}"}
+
     defaults = cfg.get("defaults") or {}
     props = cfg.get("properties") or []
     tz = ZoneInfo(defaults.get("timezone", "Asia/Tokyo"))
@@ -760,7 +760,8 @@ def main():
     jst_today_str = today.strftime("%Y-%m-%d")
     global_slack = (defaults.get("slack") or {}).get("webhook_url")
     print(f"PROPERTIES: {len(props)}")
-    if args.self_test:
+
+    if self_test:
         checks = []
         host = "hooks.slack.com"
         checks.append({"slack_dns": probe_dns(host)})
@@ -786,8 +787,9 @@ def main():
             except Exception as e:
                 print(f"SELF_TEST_SLACK: FAIL {e}")
         print("RESULT: SELF_TEST_DONE")
-        return 0
-    if args.probe_all:
+        return {"result": "SELF_TEST_DONE", "exit_code": 0, "self_test": checks}
+
+    if probe_all:
         report = []
         s3d = defaults.get("s3") or {}
         dbd = defaults.get("db") or {}
@@ -810,17 +812,23 @@ def main():
             report.append(item)
         print(json.dumps({"probe_all": report}, ensure_ascii=False, indent=2))
         print("RESULT: PROBE_DONE")
-        return 0
+        return {"result": "PROBE_DONE", "exit_code": 0, "probe_all": report}
+
     all_results, any_error = [], False
     for p in props:
         res = run_checks_for_property(p, defaults, tz, today)
         all_results.append(res)
         if res["errors"]:
             any_error = True
-    if args.dry_run:
+
+    if dry_run:
+        result = "ERROR" if any_error else "OK"
         print(json.dumps(all_results, ensure_ascii=False, indent=2))
-        print("RESULT: ERROR" if any_error else "RESULT: OK")
-        return 1 if any_error else 0
+        print(f"RESULT: {result}")
+        if any_error and raise_on_monitor_error:
+            raise RuntimeError("monitor dry-run detected errors")
+        return {"result": result, "exit_code": 1 if any_error else 0, "results": all_results}
+
     if any_error:
         url_to_subset = {}
         for r in all_results:
@@ -842,26 +850,70 @@ def main():
                 sent_any = True
             except Exception as e:
                 logging.error(f"Slack送信失敗: {e}")
+        result = "ERROR_SENT" if sent_any else "ERROR_NO_SLACK"
         print(json.dumps(all_results, ensure_ascii=False, indent=2))
-        print("RESULT: ERROR_SENT" if sent_any else "RESULT: ERROR_NO_SLACK")
-        return 1
-    else:
-        ok_urls = set()
-        for r in all_results:
-            url = r.get("_slack_webhook") or global_slack
-            if not url or not isinstance(url, str) or not url.startswith("https://hooks.slack.com/services/"):
-                continue
-            ok_urls.add(url)
-        header_text = f"データ監視アラート（{jst_today_str}）"
-        ok_blocks = build_ok_slack_blocks(jst_today_str)
-        for url in ok_urls:
-            try:
-                send_slack_batches(url, header_text, ok_blocks, max_blocks=40)
-            except Exception as e:
-                logging.error(f"Slack送信失敗(OK通知): {e}")
-        print(json.dumps(all_results, ensure_ascii=False, indent=2))
-        print("RESULT: OK")
-        return 0
+        print(f"RESULT: {result}")
+        if raise_on_monitor_error:
+            raise RuntimeError(result)
+        return {"result": result, "exit_code": 1, "results": all_results, "slack_sent": sent_any}
+
+    ok_urls = set()
+    for r in all_results:
+        url = r.get("_slack_webhook") or global_slack
+        if not url or not isinstance(url, str) or not url.startswith("https://hooks.slack.com/services/"):
+            continue
+        ok_urls.add(url)
+    header_text = f"データ監視アラート（{jst_today_str}）"
+    ok_blocks = build_ok_slack_blocks(jst_today_str)
+    for url in ok_urls:
+        try:
+            send_slack_batches(url, header_text, ok_blocks, max_blocks=40)
+        except Exception as e:
+            logging.error(f"Slack送信失敗(OK通知): {e}")
+    print(json.dumps(all_results, ensure_ascii=False, indent=2))
+    print("RESULT: OK")
+    return {"result": "OK", "exit_code": 0, "results": all_results}
+
+
+def lambda_handler(event, context):
+    event = event or {}
+    mode = event.get("mode", os.environ.get("MONITOR_MODE", "monitor"))
+    config_path = event.get("config_path") or os.environ.get("CONFIG_PATH") or os.path.join(
+        os.path.dirname(__file__),
+        "config.yaml",
+    )
+    response = run_monitor(
+        config_path=config_path,
+        dry_run=bool(event.get("dry_run") or mode == "dry_run"),
+        self_test=bool(event.get("self_test") or mode == "self_test"),
+        probe_all=bool(event.get("probe_all") or mode == "probe_all"),
+        raise_on_monitor_error=os.environ.get("RAISE_ON_MONITOR_ERROR", "").lower() in ("1", "true", "yes"),
+    )
+    return response
+
+
+def main():
+    parser = argparse.ArgumentParser(description="宿ごとのデータ監視")
+    parser.add_argument("-c", "--config", default="config.yaml")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--log-file", default="")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--probe-all", action="store_true")
+    args = parser.parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    if args.log_file:
+        fh = logging.FileHandler(args.log_file, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logging.getLogger().addHandler(fh)
+    result = run_monitor(
+        config_path=args.config,
+        dry_run=args.dry_run,
+        self_test=args.self_test,
+        probe_all=args.probe_all,
+    )
+    return int(result.get("exit_code", 1))
 
 if __name__ == "__main__":
     try:
